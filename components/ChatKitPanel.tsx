@@ -13,11 +13,7 @@ import {
 import { ErrorOverlay } from "./ErrorOverlay";
 import type { ColorScheme } from "@/hooks/useColorScheme";
 
-export type FactAction = {
-  type: "save";
-  factId: string;
-  factText: string;
-};
+export type FactAction = { type: "save"; factId: string; factText: string };
 
 type ChatKitPanelProps = {
   theme: ColorScheme;
@@ -53,8 +49,8 @@ export function ChatKitPanel({
   const [errors, setErrors] = useState<ErrorState>(() => createInitialErrors());
   const [isInitializingSession, setIsInitializingSession] = useState(true);
   const isMountedRef = useRef(true);
-  const [scriptStatus, setScriptStatus] = useState<"pending" | "ready" | "error">(
-    () => (isBrowser && window.customElements?.get("openai-chatkit") ? "ready" : "pending")
+  const [scriptStatus, setScriptStatus] = useState<"pending" | "ready" | "error">(() =>
+    isBrowser && window.customElements?.get("openai-chatkit") ? "ready" : "pending"
   );
   const [widgetInstanceKey, setWidgetInstanceKey] = useState(0);
 
@@ -62,15 +58,11 @@ export function ChatKitPanel({
     setErrors((current) => ({ ...current, ...updates }));
   }, []);
 
-  useEffect(() => {
-    return () => {
-      isMountedRef.current = false;
-    };
-  }, []);
+  useEffect(() => () => { isMountedRef.current = false }, []);
 
+  // Load status of chatkit web component (unchanged)
   useEffect(() => {
     if (!isBrowser) return;
-
     let timeoutId: number | undefined;
 
     const handleLoaded = () => {
@@ -78,12 +70,11 @@ export function ChatKitPanel({
       setScriptStatus("ready");
       setErrorState({ script: null });
     };
-
     const handleError = (event: Event) => {
       console.error("Failed to load chatkit.js", event);
       if (!isMountedRef.current) return;
       setScriptStatus("error");
-      const detail = (event as CustomEvent<unknown>)?.detail ?? "unknown error";
+      const detail = (event as CustomEvent)?.detail ?? "unknown error";
       setErrorState({ script: `Error: ${detail}`, retryable: false });
       setIsInitializingSession(false);
     };
@@ -96,11 +87,9 @@ export function ChatKitPanel({
     } else if (scriptStatus === "pending") {
       timeoutId = window.setTimeout(() => {
         if (!window.customElements?.get("openai-chatkit")) {
-          handleError(
-            new CustomEvent("chatkit-script-error", {
-              detail: "ChatKit web component is unavailable. Verify that the script URL is reachable.",
-            })
-          );
+          handleError(new CustomEvent("chatkit-script-error", {
+            detail: "ChatKit web component is unavailable. Verify that the script URL is reachable.",
+          }) as any);
         }
       }, 5000);
     }
@@ -134,6 +123,7 @@ export function ChatKitPanel({
     setWidgetInstanceKey((prev) => prev + 1);
   }, []);
 
+  // --- Hosted session creation (unchanged, but widgets enabled on the server route) ---
   const getClientSecret = useCallback(
     async (currentSecret: string | null) => {
       if (isDev) {
@@ -164,31 +154,19 @@ export function ChatKitPanel({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             workflow: { id: WORKFLOW_ID },
+            // we also turn this on on the server route, this copy here is harmless
             chatkit_configuration: {
-              // ✅ ensure widgets are enabled explicitly
-              widgets: { enabled: true },
               file_upload: { enabled: true },
+              widgets: { enabled: true },
             },
           }),
         });
 
         const raw = await response.text();
-
-        if (isDev) {
-          console.info("[ChatKitPanel] createSession response", {
-            status: response.status,
-            ok: response.ok,
-            bodyPreview: raw.slice(0, 1600),
-          });
-        }
-
         let data: Record<string, unknown> = {};
         if (raw) {
-          try {
-            data = JSON.parse(raw) as Record<string, unknown>;
-          } catch (parseError) {
-            console.error("Failed to parse create-session response", parseError);
-          }
+          try { data = JSON.parse(raw) as Record<string, unknown>; }
+          catch (e) { console.error("Failed to parse create-session response", e); }
         }
 
         if (!response.ok) {
@@ -197,11 +175,10 @@ export function ChatKitPanel({
           throw new Error(detail);
         }
 
-        const clientSecret = data?.client_secret as string | undefined;
+        const clientSecret = (data as any)?.client_secret as string | undefined;
         if (!clientSecret) throw new Error("Missing client secret in response");
 
         if (isMountedRef.current) setErrorState({ session: null, integration: null });
-
         return clientSecret;
       } catch (error) {
         console.error("Failed to create ChatKit session", error);
@@ -215,34 +192,65 @@ export function ChatKitPanel({
     [isWorkflowConfigured, setErrorState]
   );
 
-  /**
-   * PRIMARY: useChatKit widgets.onAction + sendUserMessage
-   */
-  const { control, sendUserMessage } = useChatKit({
+  // ---- CLICK HANDLER: widgets.onAction + raw event fallback ----
+  const handleWidgetAction = useCallback(
+    async (action: { type: string; payload?: any; id?: string }) => {
+      // You’ll see this for every click
+      console.info("[widgets.onAction]", action);
+
+      // Map your four options (labels OR payloads) to messages you want to send
+      const mapping: Record<string, string> = {
+        "Case Studies": "Case Studies",
+        "Slides Design": "Slides Design",
+        "Meeting Prep": "Meeting Prep",
+        "Research Help": "Research Help",
+        case_studies: "Case Studies",
+        slides_design: "Slides Design",
+        meeting_prep: "Meeting Prep",
+        research_help: "Research Help",
+      };
+
+      // Try to pick a message based on payload.text, payload.option, or action.type
+      const guess =
+        action?.payload?.text ??
+        mapping[action?.payload?.option ?? ""] ??
+        mapping[action?.type] ??
+        null;
+
+      if (!chatkit.control) {
+        console.warn("No chatkit control yet; action ignored.");
+        return { handled: false };
+      }
+
+      if (guess) {
+        // Send as a user message so your router node sees it
+        await chatkit.control.sendUserMessage({ text: guess });
+        return { handled: true };
+      }
+
+      // Fallback: echo the raw action to the thread so you can inspect what’s coming through
+      await chatkit.control.sendUserMessage({
+        text: `Clicked: ${action.type} ${JSON.stringify(action.payload ?? {})}`,
+      });
+      return { handled: true };
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  // Build ChatKit
+  const chatkit = useChatKit({
     api: { getClientSecret },
-    theme: {
-      colorScheme: theme,
-      ...getThemeConfig(theme),
-    },
-    startScreen: {
-      greeting: GREETING,
-      prompts: STARTER_PROMPTS,
-    },
-    composer: {
-      placeholder: PLACEHOLDER_INPUT,
-      attachments: { enabled: true },
-    },
+    theme: { colorScheme: theme, ...getThemeConfig(theme) },
+    startScreen: { greeting: GREETING, prompts: STARTER_PROMPTS },
+    composer: { placeholder: PLACEHOLDER_INPUT, attachments: { enabled: true } },
     threadItemActions: { feedback: false },
 
-    // 🔑 Handle widget button clicks here
-    widgets: {
-      onAction: async (action: { type?: string; payload?: any }) => {
-        if (isDev) console.info("[ChatKitPanel] widgets.onAction", action);
-        await handleWidgetActionToMessage(action, sendUserMessage);
-      },
-    },
+    // 🔑 Register the widget action handler
+    widgets: { onAction: handleWidgetAction },
 
-    onClientTool: async (invocation: { name: string; params: Record<string, unknown> }) => {
+    // existing client tools you already had
+    onClientTool: async (invocation) => {
       if (invocation.name === "switch_theme") {
         const requested = invocation.params.theme;
         if (requested === "light" || requested === "dark") {
@@ -252,7 +260,6 @@ export function ChatKitPanel({
         }
         return { success: false };
       }
-
       if (invocation.name === "record_fact") {
         const id = String(invocation.params.fact_id ?? "");
         const text = String(invocation.params.fact_text ?? "");
@@ -265,36 +272,26 @@ export function ChatKitPanel({
         });
         return { success: true };
       }
-
       return { success: false };
     },
-
-    onResponseEnd: () => onResponseEnd(),
     onResponseStart: () => setErrorState({ integration: null, retryable: false }),
+    onResponseEnd: () => onResponseEnd(),
     onThreadChange: () => processedFacts.current.clear(),
-    onError: ({ error }: { error: unknown }) => {
-      console.error("ChatKit error", error);
-    },
+    onError: ({ error }) => console.error("ChatKit error", error),
   });
 
-  /**
-   * SAFETY NET: listen for DOM events from the Web Component in case the
-   * environment emits a global event instead of using widgets.onAction.
-   */
+  // Raw DOM fallback (helps if your library version is old):
   useEffect(() => {
-    const handler = async (evt: Event) => {
-      // Some builds emit detail as { action }, others emit the action directly.
-      const detail: any = (evt as CustomEvent).detail;
-      const action = detail?.action ?? detail ?? {};
-      if (isDev) console.info("[ChatKitPanel] DOM event chatkit-widget-action", action);
-      await handleWidgetActionToMessage(action, sendUserMessage);
+    if (!isBrowser) return;
+    const fn = (e: any) => {
+      const action = e?.detail;
+      if (!action) return;
+      console.info("[window chatkit-widget-action]", action);
+      void handleWidgetAction(action);
     };
-
-    window.addEventListener("chatkit-widget-action", handler as EventListener);
-    return () => {
-      window.removeEventListener("chatkit-widget-action", handler as EventListener);
-    };
-  }, [sendUserMessage]);
+    window.addEventListener("chatkit-widget-action", fn as EventListener);
+    return () => window.removeEventListener("chatkit-widget-action", fn as EventListener);
+  }, [handleWidgetAction]);
 
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
@@ -302,7 +299,7 @@ export function ChatKitPanel({
   if (isDev) {
     console.debug("[ChatKitPanel] render state", {
       isInitializingSession,
-      hasControl: Boolean(control),
+      hasControl: Boolean(chatkit.control),
       scriptStatus,
       hasError: Boolean(blockingError),
       workflowId: WORKFLOW_ID,
@@ -313,10 +310,8 @@ export function ChatKitPanel({
     <div className="relative pb-8 flex h-[90vh] w-full rounded-2xl flex-col overflow-hidden bg-white shadow-sm transition-colors dark:bg-slate-900">
       <ChatKit
         key={widgetInstanceKey}
-        control={control}
-        className={
-          blockingError || isInitializingSession ? "pointer-events-none opacity-0" : "block h-full w-full"
-        }
+        control={chatkit.control}
+        className={blockingError || isInitializingSession ? "pointer-events-none opacity-0" : "block h-full w-full"}
       />
       <ErrorOverlay
         error={blockingError}
@@ -328,63 +323,22 @@ export function ChatKitPanel({
   );
 }
 
-/**
- * Maps a widget action to a chat message. Supports both:
- *  - { type: "conversation.send", payload: { text: "..." } }
- *  - { type: "task.select",       payload: { option: "..."} }
- */
-async function handleWidgetActionToMessage(
-  action: { type?: string; payload?: any },
-  sendUserMessage: (args: { text: string }) => Promise<void>
-) {
-  if (!action) return;
-
-  const t = action.type ?? "";
-  const text =
-    (action.payload?.text as string) ??
-    (action.payload?.option as string) ??
-    (action.payload?.value as string) ??
-    "";
-
-  if (!text) return;
-
-  if (t === "conversation.send" || t === "task.select") {
-    await sendUserMessage({ text: String(text).trim() });
-  }
-}
-
 function extractErrorDetail(payload: Record<string, unknown> | undefined, fallback: string): string {
   if (!payload) return fallback;
-
-  const error = payload.error;
+  const error = (payload as any)?.error;
   if (typeof error === "string") return error;
-
-  if (
-    error &&
-    typeof error === "object" &&
-    "message" in error &&
-    typeof (error as { message?: unknown }).message === "string"
-  ) {
-    return (error as { message: string }).message;
+  if (error && typeof error === "object" && "message" in error && typeof (error as any).message === "string") {
+    return (error as any).message;
   }
-
-  const details = payload.details;
+  const details = (payload as any)?.details;
   if (typeof details === "string") return details;
-
   if (details && typeof details === "object" && "error" in details) {
-    const nestedError = (details as { error?: unknown }).error;
-    if (typeof nestedError === "string") return nestedError;
-    if (
-      nestedError &&
-      typeof nestedError === "object" &&
-      "message" in nestedError &&
-      typeof (nestedError as { message?: unknown }).message === "string"
-    ) {
-      return (nestedError as { message: string }).message;
+    const nested = (details as any).error;
+    if (typeof nested === "string") return nested;
+    if (nested && typeof nested === "object" && "message" in nested && typeof (nested as any).message === "string") {
+      return (nested as any).message;
     }
   }
-
-  if (typeof payload.message === "string") return payload.message;
-
+  if (typeof (payload as any).message === "string") return (payload as any).message;
   return fallback;
 }
