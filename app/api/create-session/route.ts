@@ -8,7 +8,7 @@ interface CreateSessionRequestBody {
   workflowId?: string | null;
   chatkit_configuration?: {
     file_upload?: { enabled?: boolean };
-    widgets?: { enabled?: boolean }; // ⬅️ add widgets flag to the type
+    widgets?: { enabled?: boolean };
   };
 }
 
@@ -17,19 +17,17 @@ const SESSION_COOKIE_NAME = "chatkit_session_id";
 const SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 
 export async function POST(request: Request): Promise<Response> {
-  if (request.method !== "POST") {
-    return methodNotAllowedResponse();
-  }
+  if (request.method !== "POST") return methodNotAllowedResponse();
 
   let sessionCookie: string | null = null;
 
   try {
     const openaiApiKey = process.env.OPENAI_API_KEY;
     if (!openaiApiKey) {
-      return new Response(
-        JSON.stringify({ error: "Missing OPENAI_API_KEY environment variable" }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
+      return new Response(JSON.stringify({ error: "Missing OPENAI_API_KEY environment variable" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     const parsedBody = await safeParseJson<CreateSessionRequestBody>(request);
@@ -38,13 +36,6 @@ export async function POST(request: Request): Promise<Response> {
 
     const resolvedWorkflowId =
       parsedBody?.workflow?.id ?? parsedBody?.workflowId ?? WORKFLOW_ID;
-
-    if (process.env.NODE_ENV !== "production") {
-      console.info("[create-session] handling request", {
-        resolvedWorkflowId,
-        body: JSON.stringify(parsedBody),
-      });
-    }
 
     if (!resolvedWorkflowId) {
       return buildJsonResponse(
@@ -55,11 +46,10 @@ export async function POST(request: Request): Promise<Response> {
       );
     }
 
-    // Pull desired flags (default widgets ON)
     const fileUploadEnabled =
-      parsedBody?.chatkit_configuration?.file_upload?.enabled ?? false;
+      parsedBody?.chatkit_configuration?.file_upload?.enabled ?? true;
     const widgetsEnabled =
-      parsedBody?.chatkit_configuration?.widgets?.enabled ?? true; // ⬅️ default to true
+      parsedBody?.chatkit_configuration?.widgets?.enabled ?? true;
 
     const apiBase = process.env.CHATKIT_API_BASE ?? DEFAULT_CHATKIT_BASE;
     const url = `${apiBase}/v1/chatkit/sessions`;
@@ -70,7 +60,6 @@ export async function POST(request: Request): Promise<Response> {
         "Content-Type": "application/json",
         Authorization: `Bearer ${openaiApiKey}`,
         "OpenAI-Beta": "chatkit_beta=v1",
-        // Optional org/project passthrough if you set them:
         ...(process.env.OPENAI_ORG ? { "OpenAI-Organization": process.env.OPENAI_ORG } : {}),
         ...(process.env.OPENAI_PROJECT ? { "OpenAI-Project": process.env.OPENAI_PROJECT } : {}),
       },
@@ -79,17 +68,10 @@ export async function POST(request: Request): Promise<Response> {
         user: userId,
         chatkit_configuration: {
           file_upload: { enabled: fileUploadEnabled },
-          widgets: { enabled: widgetsEnabled }, // ⬅️ CRUCIAL: enable widgets so clicks are emitted
+          widgets: { enabled: widgetsEnabled }, // ✅ crucial
         },
       }),
     });
-
-    if (process.env.NODE_ENV !== "production") {
-      console.info("[create-session] upstream response", {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-      });
-    }
 
     const upstreamJson = (await upstreamResponse.json().catch(() => ({}))) as
       | Record<string, unknown>
@@ -97,11 +79,6 @@ export async function POST(request: Request): Promise<Response> {
 
     if (!upstreamResponse.ok) {
       const upstreamError = extractUpstreamError(upstreamJson);
-      console.error("OpenAI ChatKit session creation failed", {
-        status: upstreamResponse.status,
-        statusText: upstreamResponse.statusText,
-        body: upstreamJson,
-      });
       return buildJsonResponse(
         {
           error: upstreamError ?? `Failed to create session: ${upstreamResponse.statusText}`,
@@ -149,9 +126,8 @@ async function resolveUserId(request: Request): Promise<{
   sessionCookie: string | null;
 }> {
   const existing = getCookieValue(request.headers.get("cookie"), SESSION_COOKIE_NAME);
-  if (existing) {
-    return { userId: existing, sessionCookie: null };
-  }
+  if (existing) return { userId: existing, sessionCookie: null };
+
   const generated =
     typeof crypto.randomUUID === "function"
       ? crypto.randomUUID()
@@ -206,17 +182,13 @@ async function safeParseJson<T>(req: Request): Promise<T | null> {
 
 function extractUpstreamError(payload: Record<string, unknown> | undefined): string | null {
   if (!payload) return null;
-
   const error = payload.error;
   if (typeof error === "string") return error;
-
   if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
     return (error as { message: string }).message;
   }
-
   const details = payload.details;
   if (typeof details === "string") return details;
-
   if (details && typeof details === "object" && "error" in details) {
     const nestedError = (details as { error?: unknown }).error;
     if (typeof nestedError === "string") return nestedError;
@@ -224,7 +196,6 @@ function extractUpstreamError(payload: Record<string, unknown> | undefined): str
       return (nestedError as { message: string }).message;
     }
   }
-
   if (typeof payload.message === "string") return payload.message;
   return null;
 }
