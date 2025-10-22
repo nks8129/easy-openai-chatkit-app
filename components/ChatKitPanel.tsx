@@ -165,6 +165,8 @@ export function ChatKitPanel({
           body: JSON.stringify({
             workflow: { id: WORKFLOW_ID },
             chatkit_configuration: {
+              // ✅ ensure widgets are enabled explicitly
+              widgets: { enabled: true },
               file_upload: { enabled: true },
             },
           }),
@@ -213,7 +215,9 @@ export function ChatKitPanel({
     [isWorkflowConfigured, setErrorState]
   );
 
-  // ⬇️ Destructure control + sendUserMessage so we can echo widget clicks into chat
+  /**
+   * PRIMARY: useChatKit widgets.onAction + sendUserMessage
+   */
   const { control, sendUserMessage } = useChatKit({
     api: { getClientSecret },
     theme: {
@@ -230,30 +234,14 @@ export function ChatKitPanel({
     },
     threadItemActions: { feedback: false },
 
-    // ⬇️ Handle widget button clicks here
+    // 🔑 Handle widget button clicks here
     widgets: {
       onAction: async (action: { type?: string; payload?: any }) => {
-        if (isDev) console.info("[ChatKitPanel] widget onAction", action);
-
-        // Support both shapes:
-        // 1) { type: "conversation.send", payload: { text: "Case Studies" } }
-        // 2) { type: "task.select",       payload: { option: "case_studies" } }
-        const t = action?.type ?? "";
-        const text: string =
-          (action?.payload?.text as string) ??
-          (action?.payload?.option as string) ??
-          (action?.payload?.value as string) ??
-          "";
-
-        if (!text) return;
-
-        if (t === "conversation.send" || t === "task.select") {
-          await sendUserMessage({ text: String(text).trim() });
-        }
+        if (isDev) console.info("[ChatKitPanel] widgets.onAction", action);
+        await handleWidgetActionToMessage(action, sendUserMessage);
       },
     },
 
-    // Existing client tools
     onClientTool: async (invocation: { name: string; params: Record<string, unknown> }) => {
       if (invocation.name === "switch_theme") {
         const requested = invocation.params.theme;
@@ -289,6 +277,25 @@ export function ChatKitPanel({
     },
   });
 
+  /**
+   * SAFETY NET: listen for DOM events from the Web Component in case the
+   * environment emits a global event instead of using widgets.onAction.
+   */
+  useEffect(() => {
+    const handler = async (evt: Event) => {
+      // Some builds emit detail as { action }, others emit the action directly.
+      const detail: any = (evt as CustomEvent).detail;
+      const action = detail?.action ?? detail ?? {};
+      if (isDev) console.info("[ChatKitPanel] DOM event chatkit-widget-action", action);
+      await handleWidgetActionToMessage(action, sendUserMessage);
+    };
+
+    window.addEventListener("chatkit-widget-action", handler as EventListener);
+    return () => {
+      window.removeEventListener("chatkit-widget-action", handler as EventListener);
+    };
+  }, [sendUserMessage]);
+
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
 
@@ -321,13 +328,43 @@ export function ChatKitPanel({
   );
 }
 
+/**
+ * Maps a widget action to a chat message. Supports both:
+ *  - { type: "conversation.send", payload: { text: "..." } }
+ *  - { type: "task.select",       payload: { option: "..."} }
+ */
+async function handleWidgetActionToMessage(
+  action: { type?: string; payload?: any },
+  sendUserMessage: (args: { text: string }) => Promise<void>
+) {
+  if (!action) return;
+
+  const t = action.type ?? "";
+  const text =
+    (action.payload?.text as string) ??
+    (action.payload?.option as string) ??
+    (action.payload?.value as string) ??
+    "";
+
+  if (!text) return;
+
+  if (t === "conversation.send" || t === "task.select") {
+    await sendUserMessage({ text: String(text).trim() });
+  }
+}
+
 function extractErrorDetail(payload: Record<string, unknown> | undefined, fallback: string): string {
   if (!payload) return fallback;
 
   const error = payload.error;
   if (typeof error === "string") return error;
 
-  if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof (error as { message?: unknown }).message === "string"
+  ) {
     return (error as { message: string }).message;
   }
 
@@ -337,7 +374,12 @@ function extractErrorDetail(payload: Record<string, unknown> | undefined, fallba
   if (details && typeof details === "object" && "error" in details) {
     const nestedError = (details as { error?: unknown }).error;
     if (typeof nestedError === "string") return nestedError;
-    if (nestedError && typeof nestedError === "object" && "message" in nestedError && typeof (nestedError as { message?: unknown }).message === "string") {
+    if (
+      nestedError &&
+      typeof nestedError === "object" &&
+      "message" in nestedError &&
+      typeof (nestedError as { message?: unknown }).message === "string"
+    ) {
       return (nestedError as { message: string }).message;
     }
   }
