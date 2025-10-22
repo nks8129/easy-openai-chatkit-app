@@ -60,7 +60,6 @@ export function ChatKitPanel({
 
   useEffect(() => () => { isMountedRef.current = false; }, []);
 
-  // (A) load status of chatkit script (for the starter app overlay)
   useEffect(() => {
     if (!isBrowser) return;
     let timeoutId: number | undefined;
@@ -70,6 +69,7 @@ export function ChatKitPanel({
       setScriptStatus("ready");
       setErrorState({ script: null });
     };
+
     const handleError = (event: Event) => {
       console.error("Failed to load chatkit.js", event);
       if (!isMountedRef.current) return;
@@ -123,16 +123,7 @@ export function ChatKitPanel({
     setWidgetInstanceKey((prev) => prev + 1);
   }, []);
 
-  // (B) Create/refresh a ChatKit session (client secret)
   const getClientSecret = useCallback(async (currentSecret: string | null) => {
-    if (isDev) {
-      console.info("[ChatKitPanel] getClientSecret", {
-        currentSecretPresent: Boolean(currentSecret),
-        workflowId: WORKFLOW_ID,
-        endpoint: CREATE_SESSION_ENDPOINT,
-      });
-    }
-
     if (!isWorkflowConfigured) {
       const detail = "Set NEXT_PUBLIC_CHATKIT_WORKFLOW_ID in your .env.local file.";
       if (isMountedRef.current) {
@@ -155,19 +146,16 @@ export function ChatKitPanel({
           workflow: { id: WORKFLOW_ID },
           chatkit_configuration: {
             file_upload: { enabled: true },
-            // This flag is not strictly required by all backends, but harmless:
-            widgets: { enabled: true },
+            widgets: { enabled: true }, // safe; server route enables too
           },
         }),
       });
 
       const raw = await response.text();
-      let data: Record<string, unknown> = {};
-      try { if (raw) data = JSON.parse(raw); } catch {}
+      const data = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
 
       if (!response.ok) {
         const detail = extractErrorDetail(data, response.statusText);
-        console.error("Create session failed", { status: response.status, body: data });
         throw new Error(detail);
       }
 
@@ -177,7 +165,6 @@ export function ChatKitPanel({
       if (isMountedRef.current) setErrorState({ session: null, integration: null });
       return clientSecret;
     } catch (error) {
-      console.error("Failed to create ChatKit session", error);
       const detail = error instanceof Error ? error.message : "Unable to start ChatKit session.";
       if (isMountedRef.current) setErrorState({ session: detail, retryable: false });
       throw error instanceof Error ? error : new Error(detail);
@@ -186,67 +173,58 @@ export function ChatKitPanel({
     }
   }, [isWorkflowConfigured, setErrorState]);
 
-  // (C) Hook up ChatKit, including the WIDGET ACTION HANDLER
-  const {
-    control,
-    sendUserMessage,
-    sendCustomAction,
-  } = useChatKit({
+  // ⬇️ IMPORTANT: widgets.onAction + sendUserMessage + sendAction
+  const { control, sendUserMessage, sendAction } = useChatKit({
     api: { getClientSecret },
     theme: { colorScheme: theme, ...getThemeConfig(theme) },
     startScreen: { greeting: GREETING, prompts: STARTER_PROMPTS },
     composer: { placeholder: PLACEHOLDER_INPUT, attachments: { enabled: true } },
     threadItemActions: { feedback: false },
 
-    // 🔴 THIS IS THE IMPORTANT PART
     widgets: {
       onAction: async (action, item) => {
-        if (isDev) console.debug("[ChatKitPanel] widgets.onAction", { action, item });
+        if (isDev) console.debug("[widgets.onAction]", { action, item });
 
-        // Always show the user’s choice in the transcript:
-        const labelFromPayload =
+        // show the user's choice as a chat message
+        const text =
+          (action?.payload as any)?.text ??
           (action?.payload as any)?.label ??
           (action?.payload as any)?.option ??
-          (action?.type ?? "");
+          action?.type ??
+          "";
 
-        try {
-          await sendUserMessage({ text: String(labelFromPayload || action.type) });
-        } catch (e) {
-          console.error("sendUserMessage failed", e);
+        if (text) {
+          try { await sendUserMessage({ text: String(text) }); }
+          catch (e) { console.error("sendUserMessage failed", e); }
         }
 
-        // Optionally also notify the backend workflow about the click (namespaced to the widget item)
-        try {
-          await sendCustomAction(
-            { type: action.type, payload: action.payload ?? {} },
-            item?.id
-          );
-        } catch (e) {
-          // If your workflow doesn’t listen for custom actions, this is safe to ignore.
-          if (isDev) console.warn("sendCustomAction failed (ok if unused)", e);
-        }
+        // also notify backend (if you have ChatKitServer.action implemented)
+        try { await sendAction({ type: action.type, payload: action.payload ?? {} }); }
+        catch (e) { if (isDev) console.warn("sendAction failed (ok if no server handler)", e); }
 
-        return true; // indicate the action was handled
+        return true;
       },
     },
 
-    onClientTool: async (inv) => {
-      if (inv.name === "switch_theme") {
-        const requested = inv.params.theme;
+    onClientTool: async (invocation) => {
+      if (invocation.name === "switch_theme") {
+        const requested = invocation.params.theme;
         if (requested === "light" || requested === "dark") {
-          onThemeRequest(requested);
+          onThemeRequest(requested as ColorScheme);
           return { success: true };
         }
         return { success: false };
       }
-      if (inv.name === "record_fact") {
-        const id = String(inv.params.fact_id ?? "");
-        const text = String(inv.params.fact_text ?? "");
+
+      if (invocation.name === "record_fact") {
+        const id = String(invocation.params.fact_id ?? "");
+        const text = String(invocation.params.fact_text ?? "");
         if (!id || processedFacts.current.has(id)) return { success: true };
         processedFacts.current.add(id);
         void onWidgetAction({ type: "save", factId: id, factText: text.replace(/\s+/g, " ").trim() });
         return { success: true };
       }
+
       return { success: false };
     },
 
@@ -254,25 +232,10 @@ export function ChatKitPanel({
     onResponseEnd: () => onResponseEnd(),
     onThreadChange: () => processedFacts.current.clear(),
     onError: ({ error }) => console.error("ChatKit error", error),
-
-    // Optional: very helpful for debugging if clicks aren’t seen
-    onLog: ({ name, data }) => {
-      if (isDev) console.debug("[chatkit.log]", name, data);
-    },
   });
 
   const activeError = errors.session ?? errors.integration;
   const blockingError = errors.script ?? activeError;
-
-  if (isDev) {
-    console.debug("[ChatKitPanel] render", {
-      isInitializingSession,
-      hasControl: Boolean(control),
-      scriptStatus,
-      hasError: Boolean(blockingError),
-      workflowId: WORKFLOW_ID,
-    });
-  }
 
   return (
     <div className="relative pb-8 flex h-[90vh] w-full rounded-2xl flex-col overflow-hidden bg-white shadow-sm transition-colors dark:bg-slate-900">
@@ -295,18 +258,18 @@ export function ChatKitPanel({
 
 function extractErrorDetail(payload: Record<string, unknown> | undefined, fallback: string): string {
   if (!payload) return fallback;
-  const error = (payload as any).error;
+  const error = (payload as any)?.error;
   if (typeof error === "string") return error;
   if (error && typeof error === "object" && "message" in error && typeof (error as any).message === "string") {
     return (error as any).message;
   }
-  const details = (payload as any).details;
+  const details = (payload as any)?.details;
   if (typeof details === "string") return details;
   if (details && typeof details === "object" && "error" in details) {
-    const nestedError = (details as any).error;
-    if (typeof nestedError === "string") return nestedError;
-    if (nestedError && typeof nestedError === "object" && "message" in nestedError && typeof (nestedError as any).message === "string") {
-      return (nestedError as any).message;
+    const nested = (details as any).error;
+    if (typeof nested === "string") return nested;
+    if (nested && typeof nested === "object" && "message" in nested && typeof (nested as any).message === "string") {
+      return (nested as any).message;
     }
   }
   if (typeof (payload as any).message === "string") return (payload as any).message;
